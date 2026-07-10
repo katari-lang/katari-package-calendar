@@ -1,0 +1,194 @@
+// A self-contained Google Calendar tool set — pure Katari, no sidecar: the OAuth refresh-token grant
+// and both Calendar API calls are `http.fetch` with the request built and the reply parsed as `json`
+// in Katari. Its own capability (`get_google_credentials`), the two agents an app hands to the model
+// as tools (`list_events` / `create_event`), and the provider that makes wiring it a one-liner:
+// `use calendar.provider(client_id = calendar.oauth_env(key = "GOOGLE_OAUTH_CLIENT_ID"), ...)`.
+//
+// Why the OAuth app credentials are PUBLIC, not `env.get_secret` secrets: Katari's information-flow
+// model lets a secret leave the runtime only as a header value (an auth header) — a URL or a request
+// body is a public sink and rejects a `string of private`. Google's token endpoint reads the
+// client id / client secret / refresh token from the `application/x-www-form-urlencoded` body (the
+// refresh token has no header form at all), so those credentials cannot be secrets here; they are
+// provisioned as plain (non-secret) env entries and read as public strings. The short-lived access
+// token the exchange returns is likewise public (an HTTP response is declassified — it is the
+// server's answer, not a function of a secret) and rides the Calendar calls as a `Bearer` header.
+//
+// Access-token strategy: exchanged fresh on every tool call. That is the simplest honest shape for a
+// v1 — no token-lifetime or expiry bookkeeping to get wrong — and a tool call already costs a network
+// round trip, so one more is cheap. A stateful cached-token provider (like e2b's session handler) is
+// possible, but it would have to track `expires_in` and refresh on staleness; that complexity is not
+// worth it until a tool loop makes many calls per second.
+
+@"A Google Calendar API call (or the token exchange) failed: the endpoint returned a non-2xx status,
+or the token exchange came back without an access token. `message` carries the status and the
+server's body so the model can read what went wrong and adjust."
+data calendar_error(message: string)
+
+@"A calendar event trimmed to what an assistant needs: the @id@, the @summary@ (title), @start@ /
+@end@ (an RFC3339 timestamp for a timed event, a date for an all-day one), and the @html_link@ that
+opens it in a browser."
+data event(id: string, summary: string, start: string, end: string, html_link: string)
+
+@"The Google OAuth app credentials capability (provided once at the root by `use
+calendar.provider(...)`). Public strings, not secrets — see the module comment on why the token
+endpoint forces them into a public request body."
+data credentials(client_id: string, client_secret: string, refresh_token: string)
+
+@"The Google OAuth credentials capability, served by the provider for the extent of a continuation."
+request get_google_credentials() -> credentials
+
+@"Read a non-secret Google OAuth env entry by @key@ (the empty string when it is unset). These are
+plain env entries rather than `--secret` ones because the token endpoint reads them from the request
+body, which Katari treats as a public sink; the app hands each to `provider` at the root."
+agent oauth_env(key: string) -> string {
+  match (record.get(target = env.get_all(), key = key)) {
+    case null -> ""
+    case value -> value
+  }
+}
+
+@"Provide the Google OAuth app credentials for the extent of the continuation:
+`use calendar.provider(client_id = calendar.oauth_env(key = \"GOOGLE_OAUTH_CLIENT_ID\"), ...)`."
+agent provider[R, effect E](
+  client_id: string,
+  client_secret: string,
+  refresh_token: string,
+  continuation: agent (value: null) -> R with {...E, get_google_credentials},
+) -> R with E {
+  use handler (var creds = credentials(client_id = client_id, client_secret = client_secret, refresh_token = refresh_token)) {
+    request get_google_credentials() { next creds }
+  }
+  continuation(value = null)
+}
+
+// ── OAuth: the refresh-token grant ───────────────────────────────────────────
+
+@"Exchange the ambient refresh token for a short-lived access token (Google's refresh-token grant).
+The credentials ride the `application/x-www-form-urlencoded` body the token endpoint requires — so
+this is `http.fetch` with an explicit form Content-Type, not `http.post_json` (which would send
+JSON). A non-2xx status or a reply missing the access token throws `calendar_error`."
+agent access_token() -> string {
+  let creds = get_google_credentials()
+  // The token endpoint speaks form-encoding, not JSON; every value here is a public credential, so it
+  // is allowed in the (public) request body.
+  let body = string.join(parts = [
+    "grant_type=refresh_token",
+    "client_id=" ++ creds.client_id,
+    "client_secret=" ++ creds.client_secret,
+    "refresh_token=" ++ creds.refresh_token,
+  ], separator = "&")
+  let response = http.fetch(
+    url = "https://oauth2.googleapis.com/token",
+    method = "POST",
+    headers = record.set(target = record.empty(), key = "Content-Type", value = "application/x-www-form-urlencoded"),
+    body = body,
+  )
+  if (response.status >= 200 && response.status < 300) {
+    match (json.text(target = json.field(target = json.parse(text = response.body), key = "access_token"))) {
+      case "" -> prelude.throw(error = calendar_error(message = f"token exchange returned no access_token: ${response.body}"))
+      case token -> token
+    }
+  } else {
+    let status = string.to_string(value = response.status)
+    prelude.throw(error = calendar_error(message = f"token exchange failed (status ${status}): ${response.body}"))
+  }
+}
+
+@"The `Authorization: Bearer <token>` header every Calendar API call carries. The access token is
+public (the token response is declassified), so it sits in the (private-typed) header record freely."
+agent bearer(token: string) -> record[string of private] {
+  record.set(target = record.empty(), key = "Authorization", value = "Bearer " ++ token)
+}
+
+// ── the tools ────────────────────────────────────────────────────────────────
+
+@"Tool: list the upcoming events on a calendar. @calendar_id@ is the calendar's id (\"primary\" for
+the user's own, or an address like \"team@example.com\"); @time_min@ / @time_max@ bound the window as
+RFC3339 timestamps (e.g. \"2026-07-11T00:00:00Z\"); @max_results@ caps how many come back. Returns the
+events trimmed to id / summary / start / end / link — small enough to feed straight back to the model."
+agent list_events(calendar_id: string, time_min: string, time_max: string, max_results: integer ?= 10) -> array[event] {
+  let query = string.join(parts = [
+    "singleEvents=true",
+    "orderBy=startTime",
+    "timeMin=" ++ time_min,
+    "timeMax=" ++ time_max,
+    "maxResults=" ++ string.to_string(value = max_results),
+  ], separator = "&")
+  let response = http.fetch(
+    url = f"https://www.googleapis.com/calendar/v3/calendars/${calendar_id}/events?${query}",
+    method = "GET",
+    headers = bearer(token = access_token()),
+    body = "",
+  )
+  if (response.status >= 200 && response.status < 300) {
+    render_events(parsed = json.parse(text = response.body))
+  } else {
+    let status = string.to_string(value = response.status)
+    prelude.throw(error = calendar_error(message = f"list_events failed (status ${status}): ${response.body}"))
+  }
+}
+
+@"Tool: create an event on a calendar. @calendar_id@ is the target calendar (\"primary\" for the
+user's own); @summary@ is the title; @start@ / @end@ are RFC3339 timestamps (e.g.
+\"2026-07-11T15:00:00Z\"); @description@ is optional detail. Returns the created event (its id and the
+link to open it)."
+agent create_event(calendar_id: string, summary: string, start: string, end: string, description: string ?= "") -> event {
+  let base = {
+    summary = json.json_string(value = summary),
+    start = json.json_object(entries = { dateTime = json.json_string(value = start) }),
+    end = json.json_object(entries = { dateTime = json.json_string(value = end) }),
+  }
+  // The optional description is only sent when given, so an omitted arg is a smaller request rather
+  // than an empty field.
+  let payload = match (description) {
+    case "" -> base
+    case detail -> record.set(target = base, key = "description", value = json.json_string(value = detail))
+  }
+  let response = http.fetch(
+    url = f"https://www.googleapis.com/calendar/v3/calendars/${calendar_id}/events",
+    method = "POST",
+    headers = record.set(target = bearer(token = access_token()), key = "Content-Type", value = "application/json"),
+    body = json.stringify(value = json.json_object(entries = payload)),
+  )
+  if (response.status >= 200 && response.status < 300) {
+    render_event(item = json.parse(text = response.body))
+  } else {
+    let status = string.to_string(value = response.status)
+    prelude.throw(error = calendar_error(message = f"create_event failed (status ${status}): ${response.body}"))
+  }
+}
+
+// ── response parsing (read out of json) ──────────────────────────────────────
+
+@"Every event in a Calendar `events.list` reply, trimmed to `event`. A reply that carries no `items`
+array (an error shape the caller already branched away from, or an empty calendar) degrades to an
+empty list rather than throwing."
+agent render_events(parsed: json.json) -> array[event] {
+  match (json.field(target = parsed, key = "items")) {
+    case json.json_array(items => items) -> {
+      for (let item in items) { next render_event(item = item) }
+    }
+    case _ -> []
+  }
+}
+
+@"One Calendar event object as an `event`. Google nests the moment under `start` / `end` as either a
+`dateTime` (timed) or a `date` (all-day), so `event_moment` reads whichever is present."
+agent render_event(item: json.json) -> event {
+  event(
+    id = json.text(target = json.field(target = item, key = "id")),
+    summary = json.text(target = json.field(target = item, key = "summary")),
+    start = event_moment(field = json.field(target = item, key = "start")),
+    end = event_moment(field = json.field(target = item, key = "end")),
+    html_link = json.text(target = json.field(target = item, key = "htmlLink")),
+  )
+}
+
+@"The moment out of a Calendar `start` / `end` object: its `dateTime` for a timed event, falling back
+to its `date` for an all-day one."
+agent event_moment(field: json.json) -> string {
+  match (json.text(target = json.field(target = field, key = "dateTime"))) {
+    case "" -> json.text(target = json.field(target = field, key = "date"))
+    case date_time -> date_time
+  }
+}

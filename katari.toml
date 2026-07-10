@@ -1,0 +1,12 @@
+[package]
+name = "calendar"
+version = "0.1.0"
+description = "Google Calendar tools (list_events / create_event) over the OAuth refresh-token grant — pure Katari, no sidecar."
+
+[runtime]
+url = "http://localhost:3000"
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "staging"
+packages = []
