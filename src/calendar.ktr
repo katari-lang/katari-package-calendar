@@ -2,15 +2,18 @@
 // and both Calendar API calls are `http.fetch` with the request built and the reply parsed as `json`
 // in Katari. Its own capability (`get_google_credentials`), the two agents an app hands to the model
 // as tools (`list_events` / `create_event`), and the provider that makes wiring it a one-liner:
-// `use calendar.provider(client_id = calendar.oauth_env(key = "GOOGLE_OAUTH_CLIENT_ID"), ...)`.
+// `use calendar.provider(client_id = env.get_secret(key = "GOOGLE_OAUTH_CLIENT_ID"), ...)`.
 //
-// Why the OAuth app credentials are PUBLIC, not `env.get_secret` secrets: Katari's information-flow
-// model lets a secret leave the runtime only as a header value (an auth header) — a URL or a request
-// body is a public sink and rejects a `string of private`. Google's token endpoint reads the
-// client id / client secret / refresh token from the `application/x-www-form-urlencoded` body (the
-// refresh token has no header form at all), so those credentials cannot be secrets here; they are
-// provisioned as plain (non-secret) env entries and read as public strings. The short-lived access
-// token the exchange returns is likewise public (an HTTP response is declassified — it is the
+// Why the OAuth app credentials are SECRETS (`env.get_secret`, `string of private`): Katari's
+// information-flow model lets a secret leave the runtime only toward the destination server, through
+// its deliberate submission surfaces — a header value AND, since the body-sink rule, the request body.
+// Google's token endpoint reads the client id / client secret / refresh token from the
+// `application/x-www-form-urlencoded` body (the refresh token has no header form at all); that body is
+// now a private-capable sink, so the credentials are read with `env.get_secret` as `string of private`
+// and their taint rides the form body — built by concatenation (`++`), which propagates it — to the one
+// transport boundary that reveals it, for the single server the program named. Each value is
+// `form_encode`d first so a url-unsafe character in a credential cannot break the form's framing. The
+// short-lived access token the exchange returns is PUBLIC (an HTTP response is declassified — it is the
 // server's answer, not a function of a secret) and rides the Calendar calls as a `Bearer` header.
 //
 // Access-token strategy: exchanged fresh on every tool call. That is the simplest honest shape for a
@@ -30,29 +33,19 @@ opens it in a browser."
 data event(id: string, summary: string, start: string, end: string, html_link: string)
 
 @"The Google OAuth app credentials capability (provided once at the root by `use
-calendar.provider(...)`). Public strings, not secrets — see the module comment on why the token
-endpoint forces them into a public request body."
-data credentials(client_id: string, client_secret: string, refresh_token: string)
+calendar.provider(...)`). Secrets (`string of private`) — read with `env.get_secret` and submitted only
+inside the token endpoint's form body; see the module comment on the body-sink rule that lets them be."
+data credentials(client_id: string of private, client_secret: string of private, refresh_token: string of private)
 
 @"The Google OAuth credentials capability, served by the provider for the extent of a continuation."
 request get_google_credentials() -> credentials
 
-@"Read a non-secret Google OAuth env entry by @key@ (the empty string when it is unset). These are
-plain env entries rather than `--secret` ones because the token endpoint reads them from the request
-body, which Katari treats as a public sink; the app hands each to `provider` at the root."
-agent oauth_env(key: string) -> string {
-  match (record.get(target = env.get_all(), key = key)) {
-    case null -> ""
-    case value -> value
-  }
-}
-
 @"Provide the Google OAuth app credentials for the extent of the continuation:
-`use calendar.provider(client_id = calendar.oauth_env(key = \"GOOGLE_OAUTH_CLIENT_ID\"), ...)`."
+`use calendar.provider(client_id = env.get_secret(key = \"GOOGLE_OAUTH_CLIENT_ID\"), ...)`."
 agent provider[R, effect E](
-  client_id: string,
-  client_secret: string,
-  refresh_token: string,
+  client_id: string of private,
+  client_secret: string of private,
+  refresh_token: string of private,
   continuation: agent (value: null) -> R with {...E, get_google_credentials},
 ) -> R with E {
   use handler (var creds = credentials(client_id = client_id, client_secret = client_secret, refresh_token = refresh_token)) {
@@ -63,26 +56,51 @@ agent provider[R, effect E](
 
 // ── OAuth: the refresh-token grant ───────────────────────────────────────────
 
+@"Percent-encode @value@ for an `application/x-www-form-urlencoded` body: the `%` escape introducer
+(FIRST, so the escapes added below are not themselves re-encoded), the two characters that frame the
+form (`&` between fields, `=` between key and value), and the two a form decoder rewrites (`+`, which
+it turns back into a space, and a literal space). A Google refresh token or client secret can carry a
+`+` from a base64 alphabet, so this is correctness, not caution. Accepted limitation: this is not a
+full RFC 3986 encoder — every other character (including `/`, which is transport-safe in a form value
+and is common in Google refresh tokens) passes through, which covers the credentials Google issues; the
+prelude offers only literal `string.replace`, so enumerating the whole reserved set in one honest pass
+is not possible here. The value stays `string of private` throughout: a pure agent applied to a secret
+yields a secret, so the taint survives the encoding."
+agent form_encode(value: string) -> string {
+  // `%` is encoded before anything else: every replacement below introduces a `%`, so encoding it
+  // afterwards would corrupt them — a literal `&` would become `%2526` instead of `%26`.
+  let after_percent = string.replace(value = value, search = "%", replacement = "%25")
+  let after_ampersand = string.replace(value = after_percent, search = "&", replacement = "%26")
+  let after_equals = string.replace(value = after_ampersand, search = "=", replacement = "%3D")
+  let after_plus = string.replace(value = after_equals, search = "+", replacement = "%2B")
+  string.replace(value = after_plus, search = " ", replacement = "%20")
+}
+
 @"Exchange the ambient refresh token for a short-lived access token (Google's refresh-token grant).
-The credentials ride the `application/x-www-form-urlencoded` body the token endpoint requires — so
-this is `http.fetch` with an explicit form Content-Type, not `http.post_json` (which would send
-JSON). A non-2xx status or a reply missing the access token throws `calendar_error`."
+The credentials — each a `string of private` — ride the `application/x-www-form-urlencoded` body the
+token endpoint requires, so this is `http.fetch` with an explicit form Content-Type, not
+`http.post_json` (which would send JSON). A non-2xx status or a reply missing the access token throws
+`calendar_error`."
 agent access_token() -> string {
   let creds = get_google_credentials()
-  // The token endpoint speaks form-encoding, not JSON; every value here is a public credential, so it
-  // is allowed in the (public) request body.
-  let body = string.join(parts = [
-    "grant_type=refresh_token",
-    "client_id=" ++ creds.client_id,
-    "client_secret=" ++ creds.client_secret,
-    "refresh_token=" ++ creds.refresh_token,
-  ], separator = "&")
+  // The token endpoint speaks form-encoding, not JSON. Each credential is a `string of private`;
+  // `form_encode` keeps it private (a pure agent applied to a secret stays secret) and `++` carries the
+  // taint into `body`, which `http.fetch` accepts as a private-capable sink and reveals only at the
+  // transport boundary. The static keys and separators are public — only the values are secret.
+  let body = "grant_type=refresh_token" ++
+    "&client_id=" ++ form_encode(value = creds.client_id) ++
+    "&client_secret=" ++ form_encode(value = creds.client_secret) ++
+    "&refresh_token=" ++ form_encode(value = creds.refresh_token)
   let response = http.fetch(
     url = "https://oauth2.googleapis.com/token",
     method = "POST",
     headers = record.set(target = record.empty(), key = "Content-Type", value = "application/x-www-form-urlencoded"),
     body = body,
   )
+  // The information-flow moment: the request BODY just carried the private credentials, but the token
+  // endpoint's RESPONSE is declassified by design (untainted), so the `access_token` parsed out of it is
+  // PUBLIC — it rides the Calendar calls' `Authorization: Bearer` header as a public value in an
+  // otherwise private-typed header record.
   if (response.status >= 200 && response.status < 300) {
     match (json.text(target = json.field(target = json.parse(text = response.body), key = "access_token"))) {
       case "" -> prelude.throw(error = calendar_error(message = f"token exchange returned no access_token: ${response.body}"))

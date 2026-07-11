@@ -7,22 +7,25 @@ Calendar API calls build their request and parse their reply as `json`. No FFI s
 - `calendar.list_events(calendar_id, time_min, time_max, max_results?)` — upcoming events in a
   window, trimmed to id / summary / start / end / link.
 - `calendar.create_event(calendar_id, summary, start, end, description?)` — create an event.
-- `calendar.provider(client_id, client_secret, refresh_token)` — provides the OAuth credentials for
-  the extent of a continuation. Each tool call exchanges the refresh token for a fresh access token.
-- `calendar.oauth_env(key)` — read a non-secret OAuth env entry (the empty string when unset).
+- `calendar.provider(client_id, client_secret, refresh_token)` — provides the OAuth credentials (each
+  a `string of private`) for the extent of a continuation. Each tool call exchanges the refresh token
+  for a fresh access token.
 
 ## Secrets / env
 
-Three OAuth values, provisioned as **plain (non-`--secret`) env entries** — this is deliberate:
+Three OAuth values, provisioned as runtime **secrets** (`--secret`) and read with `env.get_secret`:
 
-- `GOOGLE_OAUTH_CLIENT_ID`
-- `GOOGLE_OAUTH_CLIENT_SECRET`
-- `GOOGLE_OAUTH_REFRESH_TOKEN`
+```sh
+katari env set GOOGLE_OAUTH_CLIENT_ID     --secret
+katari env set GOOGLE_OAUTH_CLIENT_SECRET --secret
+katari env set GOOGLE_OAUTH_REFRESH_TOKEN --secret
+```
 
-Katari lets a secret leave the runtime only as an auth *header*, but Google's token endpoint reads
-these credentials from the `application/x-www-form-urlencoded` request body — a public sink — and a
-refresh token has no header form at all. So they cannot be `string of private`; the module reads them
-as public strings. Treat them as sensitive at the OS level even though the type system cannot here.
+They can be secrets now because Katari's request body is a private-capable sink (the body-sink rule): a
+`string of private` may leave the runtime through a request's submission surfaces — a header value *and*
+the body — so these credentials ride the token endpoint's `application/x-www-form-urlencoded` body
+(where the refresh token, which has no header form at all, must go), revealed only at the transport
+boundary for the one server the program named — never read back out as a plain string.
 
 To get a refresh token: create an OAuth client (type "Web application" or "Desktop app") in the
 Google Cloud console, enable the Google Calendar API, then use the
@@ -35,11 +38,11 @@ authorize the `https://www.googleapis.com/auth/calendar` scope and exchange the 
 ```katari
 import calendar
 
-agent upcoming(calendar_id: string, time_min: string, time_max: string) -> array[calendar.event] with io {
+agent upcoming(calendar_id: string, time_min: string, time_max: string) -> array[calendar.event] with io | prelude.throw[env.missing_secret | calendar.calendar_error | http.fetch_error | json.parse_error] {
   use calendar.provider(
-    client_id = calendar.oauth_env(key = "GOOGLE_OAUTH_CLIENT_ID"),
-    client_secret = calendar.oauth_env(key = "GOOGLE_OAUTH_CLIENT_SECRET"),
-    refresh_token = calendar.oauth_env(key = "GOOGLE_OAUTH_REFRESH_TOKEN"),
+    client_id = env.get_secret(key = "GOOGLE_OAUTH_CLIENT_ID"),
+    client_secret = env.get_secret(key = "GOOGLE_OAUTH_CLIENT_SECRET"),
+    refresh_token = env.get_secret(key = "GOOGLE_OAUTH_REFRESH_TOKEN"),
   )
   calendar.list_events(calendar_id = calendar_id, time_min = time_min, time_max = time_max)
 }
